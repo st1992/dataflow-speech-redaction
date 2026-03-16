@@ -68,13 +68,20 @@ exports.srfAudioProcessFunc = (event, context, callback) => {
 
 			// check if file is a wav or flac audio file
 			let iExt = file.name.lastIndexOf('.');
-			let ext = (iExt < 0) ? '' : file.name.substr(iExt);
+			let ext = (iExt < 0) ? '' : file.name.substr(iExt).toLowerCase();
 			let duration;
 			if (ext === '.wav') {
 				duration = (file.size / (sampleRate * channels * (bitsPerSample / 8))) / 60;
 			}
-			else if (ext === '.flac') {
+			else if (ext === '.flac' || ext === '.ogg') {
 				duration = resArray[resArray.indexOf('duration') + 1];
+			}
+			else {
+				throw new Error(`Unsupported file format: ${ext}. Supported formats are .wav, .flac, and .ogg.`);
+			}
+
+			if (ext === '.ogg' && Number(channels) !== 2) {
+				throw new Error(`Unsupported .ogg channel count: ${channels}. Only stereo .ogg files are supported.`);
 			}
 
 			let audioConfig = {
@@ -87,6 +94,11 @@ exports.srfAudioProcessFunc = (event, context, callback) => {
 				enableSeparateRecognitionPerChannel: true,
 				model: 'phone_call'
 			};
+
+			// OGG input is supported as OGG_OPUS for Speech-to-Text.
+			if (ext === '.ogg') {
+				audioConfig.encoding = 'OGG_OPUS';
+			}
 
 			// send audio file to STT, get job name, add to pub/sub object and publish message
 			const audioRequest = {
