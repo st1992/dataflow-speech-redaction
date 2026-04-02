@@ -149,10 +149,12 @@ def _get_audio_metadata(blob, ext, file_size):
         buf.seek(0)
         try:
             audio = mutagen.oggvorbis.OggVorbis(buf)
+            sample_rate = audio.info.sample_rate
         except mutagen.oggvorbis.OggVorbisHeaderError:
             buf.seek(0)
             audio = mutagen.oggopus.OggOpus(buf)
-        sample_rate = audio.info.sample_rate
+            # OGG Opus always decodes at 48 kHz; OggOpusInfo has no sample_rate field
+            sample_rate = 48000
         channels = audio.info.channels
         duration = audio.info.length / 60.0
         return sample_rate, channels, duration
