@@ -424,7 +424,7 @@ def _redact_text(data, project, template_id):
     """Use Cloud DLP to detect sensitive findings in the transcript."""
     dlp = dlp_v2.DlpServiceClient()
     parent = dlp.common_project_path(project)
-    inspect_template_name = f"{parent}/inspectTemplates/{template_id}"
+    inspect_template_name = f"{parent}/locations/global/inspectTemplates/{template_id}"
 
     logging.info(
         "[STAGE 6 - DLP] Inspecting transcript (%d chars) | template=%s",
