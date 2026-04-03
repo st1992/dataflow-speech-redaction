@@ -425,32 +425,52 @@ def _redact_text(data, project, template_id):
     dlp = dlp_v2.DlpServiceClient()
     parent = dlp.common_project_path(project)
     inspect_template_name = f"{parent}/locations/global/inspectTemplates/{template_id}"
+    transcript = data.get("transcript") or ""
 
     logging.info(
         "[STAGE 6 - DLP] Inspecting transcript (%d chars) | template=%s",
-        len(data.get("transcript") or ""), inspect_template_name,
+        len(transcript), inspect_template_name,
     )
+    # Log a snippet so an empty/wrong transcript is immediately visible
+    logging.info(
+        "[STAGE 6 - DLP] Transcript snippet (first 300 chars): %s",
+        transcript[:300],
+    )
+
+    if not transcript:
+        logging.warning("[STAGE 6 - DLP] Transcript is empty — skipping DLP inspection.")
+        return data
 
     request = dlp_v2.InspectContentRequest(
         parent=f"{parent}/locations/global",
         inspect_template_name=inspect_template_name,
-        item={"value": data["transcript"]},
+        # Explicitly set include_quote=True so quotes are always returned
+        # regardless of whether the deployed template has it enabled.
+        inspect_config=dlp_v2.InspectConfig(include_quote=True),
+        item=dlp_v2.ContentItem(value=transcript),
     )
     response = dlp.inspect_content(request=request)
 
-    if response.result.findings:
-        for finding in response.result.findings:
-            try:
-                if finding.quote:
-                    logging.info(
-                        "[STAGE 6 - DLP] Finding: info_type=%s | likelihood=%s | quote='%s'",
-                        finding.info_type.name, finding.likelihood.name, finding.quote,
-                    )
-                    data["dlp"].append(finding.quote)
-            except AttributeError:
-                pass
-        logging.info("[STAGE 6 - DLP] Total findings: %d", len(data["dlp"]))
-    else:
-        logging.info("[STAGE 6 - DLP] No findings.")
+    raw_count = len(response.result.findings)
+    logging.info("[STAGE 6 - DLP] Raw findings returned by API: %d", raw_count)
 
+    if raw_count == 0:
+        logging.info("[STAGE 6 - DLP] No findings.")
+        return data
+
+    for finding in response.result.findings:
+        quote = finding.quote or ""
+        info_type = finding.info_type.name if finding.info_type else "UNKNOWN"
+        likelihood = finding.likelihood.name if finding.likelihood else "UNKNOWN"
+        logging.info(
+            "[STAGE 6 - DLP] Finding: info_type=%s | likelihood=%s | quote='%s'",
+            info_type, likelihood, quote,
+        )
+        # Store quote if available, otherwise fall back to the info_type name
+        # so findings are never silently dropped when quote is empty.
+        data["dlp"].append(quote if quote else f"[{info_type}]")
+
+    logging.info(
+        "[STAGE 6 - DLP] Total findings appended: %d", len(data["dlp"])
+    )
     return data
