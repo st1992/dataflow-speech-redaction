@@ -51,7 +51,15 @@ from googleapiclient import discovery
 from oauth2client.client import GoogleCredentials
 
 
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig() is a no-op if the root logger already has handlers,
+# which Cloud Run's runtime does before module load. Force the configuration
+# so our logging.info/warning/error calls always reach Cloud Logging via stdout.
+_root_logger = logging.getLogger()
+if not _root_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    _root_logger.addHandler(_handler)
+_root_logger.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------------
@@ -60,54 +68,115 @@ logging.basicConfig(level=logging.INFO)
 
 def srf_audio_to_redacted(event, context):
     """GCS-triggered Cloud Function entry point."""
+    fn_start = time.time()
     bucket_name = event["bucket"]
     file_name = event["name"]
     file_size = int(event.get("size", 0))
+    gcs_uri = f"gs://{bucket_name}/{file_name}"
+
+    logging.info(
+        "[START] srf_audio_to_redacted | file=%s | bucket=%s | size_bytes=%d",
+        file_name, bucket_name, file_size,
+    )
 
     ext = os.path.splitext(file_name)[1].lower()
     if ext not in (".wav", ".flac", ".ogg"):
+        logging.error("[STAGE 1 - VALIDATE] Unsupported format: %s", ext)
         raise ValueError(
             f"Unsupported file format: {ext}. Supported formats: .wav, .flac, .ogg"
         )
+    logging.info("[STAGE 1 - VALIDATE] File format accepted: %s", ext)
 
+    # --- Stage 2: Audio metadata --------------------------------------------
+    logging.info("[STAGE 2 - METADATA] Extracting audio metadata from GCS ...")
+    t = time.time()
     gcs_client = storage.Client()
     blob = gcs_client.bucket(bucket_name).blob(file_name)
-
     sample_rate, channels, duration = _get_audio_metadata(blob, ext, file_size)
-    logging.info(
-        "Audio metadata — sample_rate=%s  channels=%s  duration_min=%.2f",
-        sample_rate, channels, duration,
-    )
 
     if ext == ".ogg" and channels != 2:
+        logging.error(
+            "[STAGE 2 - METADATA] Unsupported .ogg channel count: %d (stereo only)", channels
+        )
         raise ValueError(
             f"Unsupported .ogg channel count: {channels}. Only stereo .ogg is supported."
         )
+    logging.info(
+        "[STAGE 2 - METADATA] Done (%.1fs) | sample_rate=%d Hz | channels=%d | duration=%.2f min",
+        time.time() - t, sample_rate, channels, duration,
+    )
 
-    # --- Submit long-running STT job ----------------------------------------
-    gcs_uri = f"gs://{bucket_name}/{file_name}"
+    # --- Stage 3: Submit STT job --------------------------------------------
+    logging.info("[STAGE 3 - STT SUBMIT] Submitting long-running STT job | uri=%s", gcs_uri)
+    t = time.time()
     operation_name = _submit_stt_job(gcs_uri, ext, sample_rate, channels)
-    logging.info("STT operation started: %s", operation_name)
+    logging.info(
+        "[STAGE 3 - STT SUBMIT] Done (%.1fs) | operation=%s",
+        time.time() - t, operation_name,
+    )
 
-    # --- Poll until the STT job is done -------------------------------------
+    # --- Stage 4: Poll STT --------------------------------------------------
+    logging.info("[STAGE 4 - STT POLL] Waiting for STT operation to complete ...")
+    t = time.time()
     stt_response = _poll_stt_operation(operation_name, duration)
+    n_results = len(stt_response.get("response", {}).get("results", []))
+    logging.info(
+        "[STAGE 4 - STT POLL] Done (%.1fs) | result_chunks=%d",
+        time.time() - t, n_results,
+    )
 
-    # --- Parse transcript + word timings ------------------------------------
+    # --- Stage 5: Parse transcript ------------------------------------------
+    logging.info("[STAGE 5 - PARSE] Parsing STT response ...")
+    t = time.time()
     parsed = _parse_stt_response(gcs_uri, stt_response)
+    transcript_len = len(parsed.get("transcript") or "")
+    word_count = len(parsed.get("words", []))
+    logging.info(
+        "[STAGE 5 - PARSE] Done (%.1fs) | transcript_chars=%d | word_timings=%d",
+        time.time() - t, transcript_len, word_count,
+    )
+    logging.info(
+        "[STAGE 5 - PARSE] Transcript preview: %.200s%s",
+        parsed.get("transcript") or "",
+        " ..." if transcript_len > 200 else "",
+    )
 
-    # --- DLP redaction -------------------------------------------------------
-    project_id = os.environ.get("GCP_PROJECT") or os.environ.get("GCLOUD_PROJECT")
+    # --- Stage 6: DLP redaction ---------------------------------------------
+    project_id = _get_project_id()
     template_id = os.environ["DLP_TEMPLATE_ID"]
+    logging.info(
+        "[STAGE 6 - DLP] Running DLP inspection | project=%s | template=%s",
+        project_id, template_id,
+    )
+    t = time.time()
     redacted = _redact_text(parsed, project_id, template_id)
+    n_findings = len(redacted.get("dlp", []))
+    logging.info(
+        "[STAGE 6 - DLP] Done (%.1fs) | findings=%d | quotes=%s",
+        time.time() - t, n_findings, redacted.get("dlp") or "none",
+    )
 
-    # --- Write output to GCS ------------------------------------------------
+    # --- Stage 7: Write output to GCS ---------------------------------------
     output_bucket = os.environ["OUTPUT_BUCKET"]
     output_blob_name = f"{os.path.basename(file_name)}_{str(uuid.uuid4())[:8]}.json"
+    logging.info(
+        "[STAGE 7 - WRITE] Writing output to gs://%s/%s ...",
+        output_bucket, output_blob_name,
+    )
+    t = time.time()
     output_blob = gcs_client.bucket(output_bucket).blob(output_blob_name)
     output_blob.upload_from_string(
         json.dumps(redacted, ensure_ascii=False), content_type="application/json"
     )
-    logging.info("Result written to gs://%s/%s", output_bucket, output_blob_name)
+    logging.info(
+        "[STAGE 7 - WRITE] Done (%.1fs) | output=gs://%s/%s",
+        time.time() - t, output_bucket, output_blob_name,
+    )
+
+    logging.info(
+        "[COMPLETE] srf_audio_to_redacted finished | file=%s | total_elapsed=%.1fs",
+        file_name, time.time() - fn_start,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +195,10 @@ def _get_audio_metadata(blob, ext, file_size):
     """
     max_header = 1 * 1024 * 1024  # 1 MB is enough for any audio header
     end_byte = min(max_header, file_size) - 1
+    logging.info(
+        "[STAGE 2 - METADATA] Downloading header bytes: 0–%d of %d total bytes",
+        end_byte, file_size,
+    )
     header_bytes = blob.download_as_bytes(start=0, end=end_byte)
     buf = io.BytesIO(header_bytes)
 
@@ -135,6 +208,10 @@ def _get_audio_metadata(blob, ext, file_size):
             channels = wf.getnchannels()
             n_frames = wf.getnframes()
         duration = (n_frames / sample_rate) / 60.0
+        logging.info(
+            "[STAGE 2 - METADATA] WAV | sample_rate=%d | channels=%d | frames=%d | duration=%.2f min",
+            sample_rate, channels, n_frames, duration,
+        )
         return sample_rate, channels, duration
 
     if ext == ".flac":
@@ -143,6 +220,10 @@ def _get_audio_metadata(blob, ext, file_size):
         sample_rate = audio.info.sample_rate
         channels = audio.info.channels
         duration = audio.info.length / 60.0
+        logging.info(
+            "[STAGE 2 - METADATA] FLAC | sample_rate=%d | channels=%d | duration=%.2f min",
+            sample_rate, channels, duration,
+        )
         return sample_rate, channels, duration
 
     if ext == ".ogg":
@@ -150,13 +231,19 @@ def _get_audio_metadata(blob, ext, file_size):
         try:
             audio = mutagen.oggvorbis.OggVorbis(buf)
             sample_rate = audio.info.sample_rate
+            logging.info("[STAGE 2 - METADATA] OGG codec detected: Vorbis")
         except mutagen.oggvorbis.OggVorbisHeaderError:
             buf.seek(0)
             audio = mutagen.oggopus.OggOpus(buf)
             # OGG Opus always decodes at 48 kHz; OggOpusInfo has no sample_rate field
             sample_rate = 48000
+            logging.info("[STAGE 2 - METADATA] OGG codec detected: Opus (sample_rate fixed at 48000 Hz)")
         channels = audio.info.channels
         duration = audio.info.length / 60.0
+        logging.info(
+            "[STAGE 2 - METADATA] OGG | sample_rate=%d | channels=%d | duration=%.2f min",
+            sample_rate, channels, duration,
+        )
         return sample_rate, channels, duration
 
     raise ValueError(f"Unhandled extension in _get_audio_metadata: {ext}")
@@ -183,6 +270,11 @@ def _submit_stt_job(gcs_uri, ext, sample_rate, channels):
     if ext == ".ogg":
         config_kwargs["encoding"] = speech.RecognitionConfig.AudioEncoding.OGG_OPUS
 
+    logging.info(
+        "[STAGE 3 - STT SUBMIT] STT config: %s",
+        {k: str(v) for k, v in config_kwargs.items()},
+    )
+
     config = speech.RecognitionConfig(**config_kwargs)
     stt_client = speech.SpeechClient()
     operation = stt_client.long_running_recognize(config=config, audio=audio)
@@ -207,22 +299,40 @@ def _poll_stt_operation(operation_name, duration_minutes):
     get_op = speech_service.operations().get(name=operation_name)
 
     sleep_secs = round(float(duration_minutes) / 2 * 60) if duration_minutes else 5
-    logging.info("Initial STT poll sleep: %s seconds", sleep_secs)
+    logging.info(
+        "[STAGE 4 - STT POLL] Initial sleep: %d s (half of %.2f min audio)",
+        sleep_secs, duration_minutes,
+    )
     time.sleep(sleep_secs)
 
+    poll_start = time.time()
     response = get_op.execute()
     retry_count = 10
+    attempt = 0
     while retry_count > 0 and not response.get("done", False):
         retry_count -= 1
-        logging.info("STT not done yet. Retries left: %s. Sleeping 120 s.", retry_count)
+        attempt += 1
+        elapsed = time.time() - poll_start
+        logging.info(
+            "[STAGE 4 - STT POLL] Attempt %d: not done yet | elapsed=%.0fs | retries_left=%d | sleeping 120s",
+            attempt, elapsed, retry_count,
+        )
         time.sleep(120)
         response = get_op.execute()
 
     if not response.get("done", False):
+        logging.error(
+            "[STAGE 4 - STT POLL] Timed out after %d attempts | operation=%s",
+            attempt, operation_name,
+        )
         raise TimeoutError(
             f"STT operation {operation_name} did not complete after polling."
         )
 
+    logging.info(
+        "[STAGE 4 - STT POLL] Operation complete | attempts=%d | total_poll_elapsed=%.0fs",
+        attempt, time.time() - poll_start,
+    )
     return response
 
 
@@ -232,6 +342,9 @@ def _poll_stt_operation(operation_name, duration_minutes):
 
 def _parse_stt_response(filename, stt_data):
     """Extract transcript text and word-level timing from the STT response."""
+    results = stt_data.get("response", {}).get("results", [])
+    logging.info("[STAGE 5 - PARSE] Processing %d result chunk(s) from STT response", len(results))
+
     result = {
         "filename": filename,
         "transcript": None,
@@ -240,13 +353,13 @@ def _parse_stt_response(filename, stt_data):
     }
 
     string_transcript = ""
-    for item in stt_data.get("response", {}).get("results", []):
+    for item in results:
         alternatives = item.get("alternatives", [{}])
         if alternatives and "transcript" in alternatives[0]:
             string_transcript += alternatives[0]["transcript"] + " "
     result["transcript"] = string_transcript.rstrip()
 
-    for item in stt_data.get("response", {}).get("results", []):
+    for item in results:
         alternatives = item.get("alternatives", [{}])
         if alternatives:
             for word in alternatives[0].get("words", []):
@@ -258,6 +371,17 @@ def _parse_stt_response(filename, stt_data):
                     }
                 )
 
+    logging.info(
+        "[STAGE 5 - PARSE] transcript_chars=%d | word_timings=%d",
+        len(result["transcript"] or ""), len(result["words"]),
+    )
+    if result["words"]:
+        first = result["words"][0]
+        last = result["words"][-1]
+        logging.info(
+            "[STAGE 5 - PARSE] First word: '%s' @ %ss | Last word: '%s' @ %ss",
+            first["word"], first["startsecs"], last["word"], last["endsecs"],
+        )
     return result
 
 
@@ -271,6 +395,11 @@ def _redact_text(data, project, template_id):
     parent = dlp.common_project_path(project)
     inspect_template_name = f"{parent}/inspectTemplates/{template_id}"
 
+    logging.info(
+        "[STAGE 6 - DLP] Inspecting transcript (%d chars) | template=%s",
+        len(data.get("transcript") or ""), inspect_template_name,
+    )
+
     request = dlp_v2.InspectContentRequest(
         parent=parent,
         inspect_template_name=inspect_template_name,
@@ -282,10 +411,15 @@ def _redact_text(data, project, template_id):
         for finding in response.result.findings:
             try:
                 if finding.quote:
+                    logging.info(
+                        "[STAGE 6 - DLP] Finding: info_type=%s | likelihood=%s | quote='%s'",
+                        finding.info_type.name, finding.likelihood.name, finding.quote,
+                    )
                     data["dlp"].append(finding.quote)
             except AttributeError:
                 pass
+        logging.info("[STAGE 6 - DLP] Total findings: %d", len(data["dlp"]))
     else:
-        logging.info("No DLP findings.")
+        logging.info("[STAGE 6 - DLP] No findings.")
 
     return data
