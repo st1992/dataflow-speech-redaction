@@ -180,6 +180,37 @@ def srf_audio_to_redacted(event, context):
 
 
 # ---------------------------------------------------------------------------
+# Project ID resolution
+# ---------------------------------------------------------------------------
+
+def _get_project_id():
+    """
+    Resolve the GCP project ID from environment variables or the metadata server.
+
+    Variable names differ across runtimes:
+      - 2nd gen Cloud Functions / Cloud Run: GOOGLE_CLOUD_PROJECT
+      - 1st gen Cloud Functions:             GCP_PROJECT
+      - Some local/legacy setups:            GCLOUD_PROJECT
+    Falls back to the instance metadata server when none of the above is set.
+    """
+    project_id = (
+        os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or os.environ.get("GCP_PROJECT")
+        or os.environ.get("GCLOUD_PROJECT")
+    )
+    if project_id:
+        return project_id
+
+    import urllib.request
+    req = urllib.request.Request(
+        "http://metadata.google.internal/computeMetadata/v1/project/project-id",
+        headers={"Metadata-Flavor": "Google"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.read().decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Audio metadata extraction (replaces ffprobe from the JS function)
 # ---------------------------------------------------------------------------
 
