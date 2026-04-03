@@ -432,7 +432,7 @@ def _redact_text(data, project, template_id):
     )
 
     request = dlp_v2.InspectContentRequest(
-        parent=parent,
+        parent=f"{parent}/locations/global",
         inspect_template_name=inspect_template_name,
         item={"value": data["transcript"]},
     )
